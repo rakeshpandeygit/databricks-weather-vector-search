@@ -1,166 +1,84 @@
 # Weather Intelligence Retrieval Service
 
-Milestone 1 harvests unstructured weather narrative text from the National Weather Service (NWS), normalizes it into a stable internal `WeatherDocument` structure, and upserts records into Lakebase/PostgreSQL.
+## Project Overview
 
-Embedding generation, pgvector storage, semantic search, and `POST /weather/search` are intentionally deferred to later milestones.
+This project ingests unstructured weather narrative text from the National Weather Service (NWS), normalizes it into a stable document format, and stores it in Databricks Lakebase (PostgreSQL). A separate embedding pipeline chunks those narratives and stores 384-dimensional vectors in a pgvector table. Semantic search over those vectors is planned for Milestone 3.
 
-## Milestone 1 Architecture
+Supported locations: `Chicago, IL` and `Austin, TX`.
+
+## Architecture
 
 ```text
 NWS API
-   ↓
-weather_client.py
-   ↓
-normalize raw NWS JSON
-   ↓
-WeatherDocument
-   ↓
-lakebase.py
-   ↓
-weather_documents table
-   ↓
-POST /weather/sync
+  -> normalization (weather_client.py)
+  -> weather_documents (Lakebase)
+  -> chunking (800 chars, 100 overlap)
+  -> MiniLM embeddings (384-dim)
+  -> weather_embeddings / pgvector
+  -> Milestone 3 semantic search (not implemented)
 ```
 
-For each supported location, the service:
+## How It Works
 
-1. Calls `GET /points/{lat},{lon}` to discover the forecast URL.
-2. Calls the returned forecast URL and normalizes each useful `properties.periods[]` item.
-3. Calls `GET /alerts/active?point={lat},{lon}` for point-specific active alerts.
-4. Normalizes each useful alert feature into the same `WeatherDocument` contract.
-5. Upserts all records into `weather_documents`.
+### A. Weather ingestion
 
-## Why Normalization Is Needed
+For each requested location, the service resolves grid coordinates, fetches multi-day forecasts and point-specific active alerts from `api.weather.gov`, and normalizes the results into `WeatherDocument` records. The Flask app exposes this as `POST /api/sync`, which upserts documents into `weather_documents`.
 
-The NWS API returns nested GeoJSON with different shapes for forecasts and alerts. The rest of the system should not depend on those raw response structures. Normalization converts external JSON into one predictable internal record shape that later milestones can chunk, embed, and search.
+### B. Embedding pipeline
 
-## NWS Endpoints Used
+`ingest_weather_embeddings.py` reads documents that need embeddings, splits `narrative_text` into overlapping character-based chunks (`CHUNK_SIZE=800`, `CHUNK_OVERLAP=100`), encodes each chunk with `sentence-transformers/all-MiniLM-L6-v2`, and writes rows to `weather_embeddings`. The model produces 384-dimensional vectors stored via the pgvector extension.
 
-Base URL: `https://api.weather.gov`
+pgvector adds a native `vector(384)` column type to PostgreSQL so embeddings can be compared with vector operators. HNSW indexing and cosine search are deferred to Milestone 3.
 
-Forecast flow:
+### C. Incremental refresh / idempotency
 
-- `GET /points/{lat},{lon}`
-- follow `properties.forecast`
-- read `properties.periods[]`
+**Document sync:** Records are upserted by stable document `id`. Re-running sync does not create duplicate rows.
 
-Alert flow:
+**`synced_at`:** This timestamp reflects when meaningful narrative content last changed — not every sync attempt. If `narrative_text` is unchanged, the existing row (including `synced_at`) is left as-is. New or changed narratives receive an updated `synced_at`.
 
-- `GET /alerts/active?point={lat},{lon}`
-- read `features[]`
+**Embedding ingest:** A document is processed when it has no embeddings for the model, or when `weather_documents.synced_at` is later than the latest `weather_embeddings.created_at` for that document. Stale embeddings are deleted and rebuilt from the current narrative. Re-running ingest with no source changes processes zero documents.
 
-Important free-text fields:
+Schema initialization is non-destructive and only occurs when the corresponding table does not exist.
 
-- forecast: `detailedForecast`
-- alerts: `description`, `instruction`
+## Data Model
 
-## WeatherDocument Contract
+**`weather_documents`** — One row per normalized forecast period or active alert. Key fields: stable `id`, `location`, `source_type` (`forecast` or `alert`), `headline`, `narrative_text`, and `synced_at`.
 
-One lightweight dataclass in `weather_client.py`:
+**`weather_embeddings`** — One or more rows per document chunk. Key fields: `document_id` (references `weather_documents.id`), `chunk_index`, `chunk_text`, `embedding vector(384)`, and `model_name`. Uniqueness is enforced on `(document_id, chunk_index, model_name)`.
 
-- `id`
-- `location`
-- `source_type` (`forecast` or `alert`)
-- `headline`
-- `narrative_text`
-- `issued_at`
-- `effective_at`
-- `payload`
-- `synced_at`
-
-Forecast IDs are deterministic, for example:
-
-```text
-Chicago, IL|2026-08-08T18:00:00-05:00
-```
-
-Alert IDs prefer the top-level GeoJSON feature `id`.
-
-## Supported Locations
-
-- `Chicago, IL` → `41.8781`, `-87.6298`
-- `Austin, TX` → `30.2672`, `-97.7431`
-
-No geocoding API is used in Milestone 1.
-
-## Local Setup
+## Run Locally
 
 ```powershell
-cd "path\to\databricks-weather-vector-search"
+cd path\to\databricks-weather-vector-search
 python -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 copy .env.example .env
 ```
 
-Edit `.env` and set:
+Required environment variables:
 
 ```env
 NWS_USER_AGENT=weather-vector-search/1.0 your-email@example.com
-```
-
-For database-backed sync testing, also set:
-
-```env
 LAKEBASE_URL=postgresql://user:password@host:5432/dbname
 ```
 
-## Local API Test (No Lakebase Required)
+**Test NWS harvesting (no database):**
 
 ```powershell
 python weather_client.py
 ```
 
-This will:
-
-1. fetch Chicago point metadata
-2. fetch Chicago multi-day forecast
-3. fetch Chicago point-specific active alerts
-4. normalize the results
-5. print 2-3 readable `WeatherDocument` examples
-
-You should see the flow:
-
-```text
-external JSON → normalization → WeatherDocument
-```
-
-## Lakebase Configuration
-
-Local development:
-
-- set `LAKEBASE_URL` in `.env`
-- set `NWS_USER_AGENT` in `.env`
-
-Databricks App:
-
-- `app.yaml` sets Lakebase scope/key env vars (same pattern as the Day 2 Lakebase assignment)
-- Lakebase URL is read from secret scope `database`, key `lakebase-url`
-- set `NWS_USER_AGENT` in the Databricks App environment configuration (not a secret — NWS has no API key)
-
-Database initialization is non-destructive and uses:
-
-- `CREATE TABLE IF NOT EXISTS`
-- `CREATE INDEX IF NOT EXISTS`
-
-It never runs `DROP TABLE`, `TRUNCATE TABLE`, or bulk deletes.
-
-## Run the Flask App
+**Run the Flask app:**
 
 ```powershell
 python app.py
 ```
 
-Health check:
+**Sync weather documents:**
 
 ```http
-GET http://localhost:5000/health
-```
-
-Sync example:
-
-```http
-POST http://localhost:5000/weather/sync
+POST http://localhost:5000/api/sync
 Content-Type: application/json
 
 {
@@ -169,54 +87,64 @@ Content-Type: application/json
 }
 ```
 
-Example response:
+**Test embeddings locally (no database):**
 
-```json
-{
-  "locations": ["Chicago, IL", "Austin, TX"],
-  "documents_synced": 25,
-  "source_counts": {
-    "forecast": 24,
-    "alert": 1
-  }
-}
+```powershell
+python ingest_weather_embeddings.py --local-test
 ```
 
-If one location fails and another succeeds, the response uses partial-success behavior and may include:
+**Ingest embeddings to Lakebase** (after sync has populated `weather_documents`):
 
-```json
-"errors": [
-  {
-    "location": "Austin, TX",
-    "message": "..."
-  }
-]
+```powershell
+python ingest_weather_embeddings.py
 ```
 
-## Upsert / Idempotency
+The first embedding run downloads the MiniLM model (~80 MB).
 
-Records are written with:
+## Databricks Deployment
+
+The Flask app is deployed via `app.yaml`. The Lakebase connection URL is resolved from Databricks secrets (`database` scope, `lakebase-url` key). `NWS_USER_AGENT` is provided as app environment configuration. Embedding ingestion is currently a standalone script, not part of the Flask app.
+
+## Verification
 
 ```sql
-INSERT ... ON CONFLICT (id) DO UPDATE
+-- Embedding row count
+SELECT COUNT(*) FROM weather_embeddings;
+
+-- Vector dimension (should always be 384)
+SELECT document_id, chunk_index, vector_dims(embedding) AS dims
+FROM weather_embeddings
+LIMIT 5;
+
+-- Source freshness vs embeddings
+SELECT wd.id, wd.synced_at, MAX(we.created_at) AS latest_embedding_at
+FROM weather_documents wd
+LEFT JOIN weather_embeddings we
+  ON we.document_id = wd.id
+ AND we.model_name = 'sentence-transformers/all-MiniLM-L6-v2'
+GROUP BY wd.id, wd.synced_at
+ORDER BY wd.id;
 ```
 
-Re-running the same sync should keep approximately the same number of rows while refreshing mutable fields such as `headline`, `narrative_text`, timestamps, and `payload`.
+Documents where `synced_at <= latest_embedding_at` should be skipped on the next ingest run.
 
-## Current Limitations
+## Project Structure
 
-- Only `Chicago, IL` and `Austin, TX` are supported.
-- Hourly forecast is not ingested in Milestone 1.
-- No embeddings, pgvector columns, or semantic search yet.
-- `ingest_weather_embeddings.py` is a placeholder for Milestone 2.
-- `POST /weather/search` is not implemented yet.
+| File | Role |
+|---|---|
+| `weather_client.py` | NWS API calls and normalization |
+| `lakebase.py` | Lakebase connection and persistence |
+| `app.py` | Flask API (`POST /api/sync`) |
+| `ingest_weather_embeddings.py` | Chunking and embedding pipeline |
+| `schema.sql` | `weather_documents` DDL |
+| `schema_embeddings.sql` | `weather_embeddings` DDL |
+| `app.yaml` | Databricks App config |
+| `requirements.txt` | Python dependencies |
 
-## Project Files
+## Current Status
 
-- `weather_client.py` — NWS harvesting and normalization
-- `lakebase.py` — PostgreSQL/Lakebase connection and upsert
-- `app.py` — Flask API with `POST /weather/sync`
-- `ingest_weather_embeddings.py` — Milestone 2 placeholder
-- `schema.sql` — `weather_documents` DDL
-- `app.yaml` — Databricks App startup config
-- `requirements.txt` — Milestone 1 dependencies
+| Milestone | Scope | Status |
+|---|---|---|
+| Milestone 1 | Weather ingestion | COMPLETE |
+| Milestone 2 | Chunking + embeddings | COMPLETE |
+| Milestone 3 | Semantic search | NEXT |
