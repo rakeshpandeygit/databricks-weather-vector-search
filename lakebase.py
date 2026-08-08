@@ -85,6 +85,19 @@ def initialize_weather_documents() -> None:
         connection.commit()
 
 
+def _table_exists() -> bool:
+    """Check if weather_documents table exists."""
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables 
+                    WHERE table_name = 'weather_documents'
+                );
+            """)
+            return cursor.fetchone()[0]
+
+
 def _document_to_row(document: WeatherDocument) -> dict:
     return {
         "id": document.id,
@@ -104,7 +117,10 @@ def upsert_weather_documents(documents: list[WeatherDocument]) -> int:
     if not documents:
         return 0
 
-    initialize_weather_documents()
+    # Only initialize if table doesn't exist (avoids permission errors)
+    if not _table_exists():
+        initialize_weather_documents()
+    
     rows = [_document_to_row(document) for document in documents]
 
     with get_connection() as connection:

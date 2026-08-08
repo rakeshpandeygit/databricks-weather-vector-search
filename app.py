@@ -23,8 +23,19 @@ def _count_by_source(documents) -> dict[str, int]:
             counts[document.source_type] += 1
     return counts
 
+# To validate app deployment in databricks, should return status running
+@app.get("/")
+def home():
+    return {
+        "status":"running",
+        "service":"Weather Vector Search",
+        "nws_user_agent_configured": bool(os.getenv("NWS_USER_AGENT"))
+    }
+
+
 # Server Side Endpoint to sync weather documents
 @app.post("/weather/sync")
+@app.route("/api/sync", methods=["POST"])
 def weather_sync():
     """Fetch NWS data for requested locations and upsert weather documents."""
     body = request.get_json(silent=True)

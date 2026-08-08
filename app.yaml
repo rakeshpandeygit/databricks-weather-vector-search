@@ -7,3 +7,5 @@ env:
     value: "database"
   - name: LAKEBASE_SECRET_KEY
     value: "lakebase-url"
+  - name: NWS_USER_AGENT
+    value: "(databricks-weather-vector-search/1.0,your-email@example.com )"
