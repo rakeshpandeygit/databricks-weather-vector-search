@@ -11,6 +11,8 @@ from flask import Flask, jsonify, request
 from lakebase import upsert_weather_documents
 from weather_client import SUPPORTED_LOCATIONS, fetch_weather_documents
 
+from ingest_weather_embeddings import run_ingest
+
 load_dotenv()
 
 app = Flask(__name__)
@@ -107,6 +109,17 @@ def health():
     """Simple health check endpoint."""
     return jsonify({"status": "ok"})
 
+# This API route is just an additional trigger because of the limitations encountered in Databricks Free Edition while executing the embedding ingestion notebook
+
+@app.post("/api/embeddings/ingest")
+def ingest_embeddings():
+    try:
+        summary = run_ingest()
+        return jsonify(summary), 200
+    except Exception as exc:
+        return jsonify({
+            "error": f"Embedding ingestion failed: {exc}"
+        }), 500
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))

@@ -16,6 +16,11 @@ NWS_BASE_URL = "https://api.weather.gov"
 SUPPORTED_LOCATIONS: dict[str, dict[str, float]] = {
     "Chicago, IL": {"lat": 41.8781, "lon": -87.6298},
     "Austin, TX": {"lat": 30.2672, "lon": -97.7431},
+
+    # Temporary integration-test location with an active NWS alert
+    "Beaver/Lawrence, PA": {"lat": 40.88, "lon": -80.272},
+    "Glasscock, TX": {"lat": 31.778333333333332, "lon": -101.84666666666668},
+
 }
 
 DEFAULT_TIMEOUT = (10, 30)
