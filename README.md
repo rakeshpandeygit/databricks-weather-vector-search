@@ -18,7 +18,11 @@ NWS API
   -> Milestone 3 semantic search (not implemented)
 ```
 
+
+
 ## How It Works
+
+
 
 ### A. Weather ingestion
 
@@ -34,7 +38,7 @@ pgvector adds a native `vector(384)` column type to PostgreSQL so embeddings can
 
 **Document sync:** Records are upserted by stable document `id`. Re-running sync does not create duplicate rows.
 
-**`synced_at`:** This timestamp reflects when meaningful narrative content last changed — not every sync attempt. If `narrative_text` is unchanged, the existing row (including `synced_at`) is left as-is. New or changed narratives receive an updated `synced_at`.
+`synced_at`**:** This timestamp reflects when meaningful narrative content last changed — not every sync attempt. If `narrative_text` is unchanged, the existing row (including `synced_at`) is left as-is. New or changed narratives receive an updated `synced_at`.
 
 **Embedding ingest:** A document is processed when it has no embeddings for the model, or when `weather_documents.synced_at` is later than the latest `weather_embeddings.created_at` for that document. Stale embeddings are deleted and rebuilt from the current narrative. Re-running ingest with no source changes processes zero documents.
 
@@ -42,9 +46,9 @@ Schema initialization is non-destructive and only occurs when the corresponding 
 
 ## Data Model
 
-**`weather_documents`** — One row per normalized forecast period or active alert. Key fields: stable `id`, `location`, `source_type` (`forecast` or `alert`), `headline`, `narrative_text`, and `synced_at`.
+`weather_documents` — One row per normalized forecast period or active alert. Key fields: stable `id`, `location`, `source_type` (`forecast` or `alert`), `headline`, `narrative_text`, and `synced_at`.
 
-**`weather_embeddings`** — One or more rows per document chunk. Key fields: `document_id` (references `weather_documents.id`), `chunk_index`, `chunk_text`, `embedding vector(384)`, and `model_name`. Uniqueness is enforced on `(document_id, chunk_index, model_name)`.
+`weather_embeddings` — One or more rows per document chunk. Key fields: `document_id` (references `weather_documents.id`), `chunk_index`, `chunk_text`, `embedding vector(384)`, and `model_name`. Uniqueness is enforced on `(document_id, chunk_index, model_name)`.
 
 ## Run Locally
 
@@ -130,21 +134,70 @@ Documents where `synced_at <= latest_embedding_at` should be skipped on the next
 
 ## Project Structure
 
-| File | Role |
-|---|---|
-| `weather_client.py` | NWS API calls and normalization |
-| `lakebase.py` | Lakebase connection and persistence |
-| `app.py` | Flask API (`POST /api/sync`) |
-| `ingest_weather_embeddings.py` | Chunking and embedding pipeline |
-| `schema.sql` | `weather_documents` DDL |
-| `schema_embeddings.sql` | `weather_embeddings` DDL |
-| `app.yaml` | Databricks App config |
-| `requirements.txt` | Python dependencies |
+
+| File                           | Role                                |
+| ------------------------------ | ----------------------------------- |
+| `weather_client.py`            | NWS API calls and normalization     |
+| `lakebase.py`                  | Lakebase connection and persistence |
+| `app.py`                       | Flask API (`POST /api/sync`)        |
+| `ingest_weather_embeddings.py` | Chunking and embedding pipeline     |
+| `schema.sql`                   | `weather_documents` DDL             |
+| `schema_embeddings.sql`        | `weather_embeddings` DDL            |
+| `app.yaml`                     | Databricks App config               |
+| `requirements.txt`             | Python dependencies                 |
+
+
+
 
 ## Current Status
 
-| Milestone | Scope | Status |
-|---|---|---|
-| Milestone 1 | Weather ingestion | COMPLETE |
+
+| Milestone   | Scope                 | Status   |
+| ----------- | --------------------- | -------- |
+| Milestone 1 | Weather ingestion     | COMPLETE |
 | Milestone 2 | Chunking + embeddings | COMPLETE |
-| Milestone 3 | Semantic search | NEXT |
+| Milestone 3 | Semantic search       | NEXT     |
+
+
+
+
+## Known Limitations and Databricks Notes
+
+
+
+### Sync `limit` behavior
+
+`POST /api/sync` currently applies `limit` after forecast and alert documents
+have been combined. Forecast documents are added first, followed by active
+alerts.
+
+As a result, a small limit may be consumed entirely by forecast records and
+exclude an active alert from the sync.
+
+For example, using `"limit": 10` may return the first 10 forecast documents
+even when NWS has an active alert for the requested location.
+
+For complete ingestion, omit `limit` or use a sufficiently large value.
+Refining the limit semantics is deferred to a later iteration.
+
+### Running embedding ingestion on Databricks Free Edition
+
+The embedding pipeline can be executed directly with:
+
+`python ingest_weather_embeddings.py`
+
+However, during testing on Databricks Free Edition, running
+`sentence-transformers` directly from the workspace/notebook environment
+introduced dependency/runtime limitations.
+
+To keep the embedding logic unchanged while allowing it to execute in the
+deployed Databricks App environment, the application also exposes:
+
+`POST /api/embeddings/ingest`
+
+This endpoint is only a trigger. The embedding implementation remains in
+`ingest_weather_embeddings.py` and both execution paths use the same
+`run_ingest()` pipeline.
+
+The deployed-app route was used for Databricks integration testing and
+successfully persisted embeddings to Lakebase.
