@@ -136,6 +136,56 @@ class EmbeddingRecord:
     created_at: datetime
 
 
+@dataclass
+class SearchResult:
+    document_id: str
+    chunk_index: int
+    chunk_text: str
+    location: str
+    source_type: str
+    headline: str
+    effective_at: datetime | None
+    distance: float
+
+
+SEARCH_EMBEDDINGS_SQL = """
+SELECT
+    we.document_id,
+    we.chunk_index,
+    we.chunk_text,
+    wd.location,
+    wd.source_type,
+    wd.headline,
+    wd.effective_at,
+    we.embedding <=> %s::vector AS distance
+FROM weather_embeddings we
+JOIN weather_documents wd
+  ON wd.id = we.document_id
+WHERE we.model_name = %s
+ORDER BY we.embedding <=> %s::vector
+LIMIT %s
+"""
+
+SEARCH_EMBEDDINGS_BY_SOURCE_SQL = """
+SELECT
+    we.document_id,
+    we.chunk_index,
+    we.chunk_text,
+    wd.location,
+    wd.source_type,
+    wd.headline,
+    wd.effective_at,
+    we.embedding <=> %s::vector AS distance
+FROM weather_embeddings we
+JOIN weather_documents wd
+  ON wd.id = we.document_id
+WHERE we.model_name = %s
+  AND wd.source_type = %s
+ORDER BY we.embedding <=> %s::vector
+LIMIT %s
+"""
+
+
 def get_lakebase_url() -> str:
     """Resolve the database URL from local env or Databricks secrets."""
     load_dotenv()
@@ -290,3 +340,42 @@ def upsert_weather_embeddings(records: list[EmbeddingRecord]) -> int:
         connection.commit()
 
     return len(rows)
+
+
+def search_weather_embeddings(
+    query_embedding: list[float],
+    model_name: str,
+    top_k: int,
+    source_type: str | None = None,
+) -> list[SearchResult]:
+    """Return the closest weather embedding chunks by cosine distance."""
+    if not _table_exists("weather_embeddings"):
+        return []
+
+    with get_connection() as connection:
+        with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+            if source_type is None:
+                cursor.execute(
+                    SEARCH_EMBEDDINGS_SQL,
+                    (query_embedding, model_name, query_embedding, top_k),
+                )
+            else:
+                cursor.execute(
+                    SEARCH_EMBEDDINGS_BY_SOURCE_SQL,
+                    (query_embedding, model_name, source_type, query_embedding, top_k),
+                )
+            rows = cursor.fetchall()
+
+    return [
+        SearchResult(
+            document_id=row["document_id"],
+            chunk_index=row["chunk_index"],
+            chunk_text=row["chunk_text"],
+            location=row["location"],
+            source_type=row["source_type"],
+            headline=row["headline"],
+            effective_at=row["effective_at"],
+            distance=float(row["distance"]),
+        )
+        for row in rows
+    ]

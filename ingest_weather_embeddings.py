@@ -56,6 +56,12 @@ def load_model() -> SentenceTransformer:
     return _model
 
 
+def embed_query(query: str) -> list[float]:
+    """Embed a single search query using the shared MiniLM model."""
+    model = load_model()
+    return embed_texts(model, [query])[0]
+
+
 def embed_texts(model: SentenceTransformer, texts: list[str]) -> list[list[float]]:
     """Generate embeddings for a list of text chunks."""
     if not texts:

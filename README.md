@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-This project ingests unstructured weather narrative text from the National Weather Service (NWS), normalizes it into a stable document format, and stores it in Databricks Lakebase (PostgreSQL). A separate embedding pipeline chunks those narratives and stores 384-dimensional vectors in a pgvector table. Semantic search over those vectors is planned for Milestone 3.
+This project ingests unstructured weather narrative text from the National Weather Service (NWS), normalizes it into a stable document format, and stores it in Databricks Lakebase (PostgreSQL). An embedding pipeline chunks those narratives and stores 384-dimensional vectors in a pgvector table. Semantic retrieval ranks the closest chunks by cosine distance.
 
 Supported locations: `Chicago, IL` and `Austin, TX`.
 
@@ -15,189 +15,156 @@ NWS API
   -> chunking (800 chars, 100 overlap)
   -> MiniLM embeddings (384-dim)
   -> weather_embeddings / pgvector
-  -> Milestone 3 semantic search (not implemented)
+  -> POST /weather/search (cosine retrieval)
 ```
-
-
 
 ## How It Works
 
+### Weather ingestion
 
+Forecasts and alerts are normalized into the same `WeatherDocument` schema with `source_type` set to `forecast` or `alert`. Upsert via `POST /weather/sync`.
 
-### A. Weather ingestion
+### Embedding pipeline
 
-For each requested location, the service resolves grid coordinates, fetches multi-day forecasts and point-specific active alerts from `api.weather.gov`, and normalizes the results into `WeatherDocument` records. The Flask app exposes this as `POST /api/sync`, which upserts documents into `weather_documents`.
+Documents are chunked and encoded with `sentence-transformers/all-MiniLM-L6-v2`. Run via `python ingest_weather_embeddings.py` or `POST /api/embeddings/ingest`. Embeddings rebuild only when missing or older than the source document's `synced_at`.
 
-### B. Embedding pipeline
+### Semantic search
 
-`ingest_weather_embeddings.py` reads documents that need embeddings, splits `narrative_text` into overlapping character-based chunks (`CHUNK_SIZE=800`, `CHUNK_OVERLAP=100`), encodes each chunk with `sentence-transformers/all-MiniLM-L6-v2`, and writes rows to `weather_embeddings`. The model produces 384-dimensional vectors stored via the pgvector extension.
+`POST /weather/search` embeds the query with the same MiniLM model, then ranks chunks using pgvector cosine distance (`<=>`). Smaller `distance` means a closer match. `similarity` is `1.0 - distance`. Search can return all source types or filter to `alert` or `forecast`. Retrieval only — no LLM answer generation.
 
-pgvector adds a native `vector(384)` column type to PostgreSQL so embeddings can be compared with vector operators. HNSW indexing and cosine search are deferred to Milestone 3.
+## API Endpoints
 
-### C. Incremental refresh / idempotency
+| Required route | Databricks alias | Purpose |
+|---|---|---|
+| `POST /weather/sync` | `POST /api/sync` | Sync NWS documents |
+| `POST /weather/search` | `POST /api/search` | Semantic retrieval |
 
-**Document sync:** Records are upserted by stable document `id`. Re-running sync does not create duplicate rows.
+Additional: `POST /api/embeddings/ingest` (embedding trigger for Databricks)
 
-`synced_at`**:** This timestamp reflects when meaningful narrative content last changed — not every sync attempt. If `narrative_text` is unchanged, the existing row (including `synced_at`) is left as-is. New or changed narratives receive an updated `synced_at`.
+**Sync example:**
 
-**Embedding ingest:** A document is processed when it has no embeddings for the model, or when `weather_documents.synced_at` is later than the latest `weather_embeddings.created_at` for that document. Stale embeddings are deleted and rebuilt from the current narrative. Re-running ingest with no source changes processes zero documents.
+```http
+POST http://localhost:5000/weather/sync
+Content-Type: application/json
 
-Schema initialization is non-destructive and only occurs when the corresponding table does not exist.
+{"locations": ["Chicago, IL", "Austin, TX"]}
+```
 
-## Data Model
+**Search example (all sources):**
 
-`weather_documents` — One row per normalized forecast period or active alert. Key fields: stable `id`, `location`, `source_type` (`forecast` or `alert`), `headline`, `narrative_text`, and `synced_at`.
+```http
+POST http://localhost:5000/weather/search
+Content-Type: application/json
 
-`weather_embeddings` — One or more rows per document chunk. Key fields: `document_id` (references `weather_documents.id`), `chunk_index`, `chunk_text`, `embedding vector(384)`, and `model_name`. Uniqueness is enforced on `(document_id, chunk_index, model_name)`.
+{
+  "query": "risk of flooding near rivers",
+  "top_k": 5
+}
+```
+
+**Search with source filter:**
+
+```http
+POST http://localhost:5000/weather/search
+Content-Type: application/json
+
+{
+  "query": "severe thunderstorms",
+  "top_k": 5,
+  "source_type": "alert"
+}
+```
+
+Allowed `source_type` values: `alert`, `forecast`. Invalid values return HTTP 400.
 
 ## Run Locally
 
 ```powershell
-cd path\to\databricks-weather-vector-search
 python -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 copy .env.example .env
 ```
 
-Required environment variables:
-
 ```env
 NWS_USER_AGENT=weather-vector-search/1.0 your-email@example.com
 LAKEBASE_URL=postgresql://user:password@host:5432/dbname
 ```
 
-**Test NWS harvesting (no database):**
-
 ```powershell
 python weather_client.py
-```
-
-**Run the Flask app:**
-
-```powershell
 python app.py
-```
-
-**Sync weather documents:**
-
-```http
-POST http://localhost:5000/api/sync
-Content-Type: application/json
-
-{
-  "locations": ["Chicago, IL", "Austin, TX"],
-  "limit": 50
-}
-```
-
-**Test embeddings locally (no database):**
-
-```powershell
 python ingest_weather_embeddings.py --local-test
-```
-
-**Ingest embeddings to Lakebase** (after sync has populated `weather_documents`):
-
-```powershell
 python ingest_weather_embeddings.py
 ```
 
-The first embedding run downloads the MiniLM model (~80 MB).
+## HNSW Index (Optional)
+
+Exact cosine search works without an ANN index. HNSW is an approximate-nearest-neighbor optimization for larger datasets.
+
+The index is **not** created automatically during sync, search, or embedding ingest because repeated `CREATE INDEX` can fail when the connected role does not own the table.
+
+Create it once explicitly:
+
+```powershell
+python setup_vector_index.py
+```
+
+Index SQL:
+
+```sql
+CREATE INDEX IF NOT EXISTS idx_weather_embeddings_hnsw
+ON weather_embeddings
+USING hnsw (embedding vector_cosine_ops);
+```
+
+## Query Plan Benchmark
+
+Compare plans before and after creating the HNSW index using `EXPLAIN ANALYZE` in Lakebase. Replace the vector literal with any valid 384-dimensional query vector.
+
+**State A — before HNSW:**
+
+```sql
+EXPLAIN ANALYZE
+SELECT we.document_id, we.chunk_text,
+       we.embedding <=> '[0.01,0.02,...]'::vector AS distance
+FROM weather_embeddings we
+JOIN weather_documents wd ON wd.id = we.document_id
+WHERE we.model_name = 'sentence-transformers/all-MiniLM-L6-v2'
+ORDER BY we.embedding <=> '[0.01,0.02,...]'::vector
+LIMIT 5;
+```
+
+**State B — after HNSW:** run the same query again.
+
+With only tens of vectors, PostgreSQL may still choose a sequential scan and latency differences may be negligible. The benchmark demonstrates index setup and plan comparison — not performance gains on this tiny dataset. Do not force planner settings to manufacture a faster result.
 
 ## Databricks Deployment
 
-The Flask app is deployed via `app.yaml`. The Lakebase connection URL is resolved from Databricks secrets (`database` scope, `lakebase-url` key). `NWS_USER_AGENT` is provided as app environment configuration. Embedding ingestion is currently a standalone script, not part of the Flask app.
-
-## Verification
-
-```sql
--- Embedding row count
-SELECT COUNT(*) FROM weather_embeddings;
-
--- Vector dimension (should always be 384)
-SELECT document_id, chunk_index, vector_dims(embedding) AS dims
-FROM weather_embeddings
-LIMIT 5;
-
--- Source freshness vs embeddings
-SELECT wd.id, wd.synced_at, MAX(we.created_at) AS latest_embedding_at
-FROM weather_documents wd
-LEFT JOIN weather_embeddings we
-  ON we.document_id = wd.id
- AND we.model_name = 'sentence-transformers/all-MiniLM-L6-v2'
-GROUP BY wd.id, wd.synced_at
-ORDER BY wd.id;
-```
-
-Documents where `synced_at <= latest_embedding_at` should be skipped on the next ingest run.
+Deploy via `app.yaml`. Lakebase URL comes from Databricks secrets (`database` / `lakebase-url`). `NWS_USER_AGENT` is set in app environment configuration.
 
 ## Project Structure
 
-
-| File                           | Role                                |
-| ------------------------------ | ----------------------------------- |
-| `weather_client.py`            | NWS API calls and normalization     |
-| `lakebase.py`                  | Lakebase connection and persistence |
-| `app.py`                       | Flask API (`POST /api/sync`)        |
-| `ingest_weather_embeddings.py` | Chunking and embedding pipeline     |
-| `schema.sql`                   | `weather_documents` DDL             |
-| `schema_embeddings.sql`        | `weather_embeddings` DDL            |
-| `app.yaml`                     | Databricks App config               |
-| `requirements.txt`             | Python dependencies                 |
-
-
-
+| File | Role |
+|---|---|
+| `weather_client.py` | NWS API calls and normalization |
+| `lakebase.py` | Lakebase connection, persistence, vector search |
+| `app.py` | Flask API |
+| `ingest_weather_embeddings.py` | Chunking and embedding pipeline |
+| `setup_vector_index.py` | One-time HNSW index setup |
+| `schema.sql` / `schema_embeddings.sql` | Table DDL |
+| `app.yaml` | Databricks App config |
 
 ## Current Status
 
-
-| Milestone   | Scope                 | Status   |
-| ----------- | --------------------- | -------- |
-| Milestone 1 | Weather ingestion     | COMPLETE |
+| Milestone | Scope | Status |
+|---|---|---|
+| Milestone 1 | Weather ingestion | COMPLETE |
 | Milestone 2 | Chunking + embeddings | COMPLETE |
-| Milestone 3 | Semantic search       | NEXT     |
+| Milestone 3 | Semantic search + source filter | COMPLETE |
 
+## Known Limitations
 
-
-
-## Known Limitations and Databricks Notes
-
-
-
-### Sync `limit` behavior
-
-`POST /api/sync` currently applies `limit` after forecast and alert documents
-have been combined. Forecast documents are added first, followed by active
-alerts.
-
-As a result, a small limit may be consumed entirely by forecast records and
-exclude an active alert from the sync.
-
-For example, using `"limit": 10` may return the first 10 forecast documents
-even when NWS has an active alert for the requested location.
-
-For complete ingestion, omit `limit` or use a sufficiently large value.
-Refining the limit semantics is deferred to a later iteration.
-
-### Running embedding ingestion on Databricks Free Edition
-
-The embedding pipeline can be executed directly with:
-
-`python ingest_weather_embeddings.py`
-
-However, during testing on Databricks Free Edition, running
-`sentence-transformers` directly from the workspace/notebook environment
-introduced dependency/runtime limitations.
-
-To keep the embedding logic unchanged while allowing it to execute in the
-deployed Databricks App environment, the application also exposes:
-
-`POST /api/embeddings/ingest`
-
-This endpoint is only a trigger. The embedding implementation remains in
-`ingest_weather_embeddings.py` and both execution paths use the same
-`run_ingest()` pipeline.
-
-The deployed-app route was used for Databricks integration testing and
-successfully persisted embeddings to Lakebase.
+- Only `Chicago, IL` and `Austin, TX` are supported.
+- Search returns retrieved chunks only — no generated answer.
+- `POST /api/sync` `limit` may exclude alerts when set too low.
