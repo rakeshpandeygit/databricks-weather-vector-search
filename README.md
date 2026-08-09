@@ -168,3 +168,104 @@ Deploy via `app.yaml`. Lakebase URL comes from Databricks secrets (`database` / 
 - Only `Chicago, IL` and `Austin, TX` are supported.
 - Search returns retrieved chunks only — no generated answer.
 - `POST /api/sync` `limit` may exclude alerts when set too low.
+
+
+## Assignment Deliverable Notes
+
+### Data source choice
+
+The project uses the National Weather Service (NWS) API because it is free,
+requires no API key, and provides useful unstructured narrative text for both
+weather forecasts and active alerts. This makes it a good source for testing
+normalization, embeddings, and semantic retrieval without adding external
+authentication complexity.
+
+### Schema and embedding decisions
+
+Weather data is normalized into `weather_documents`, with key fields including:
+
+- `id` — stable deduplication key
+- `location`
+- `source_type` — `forecast` or `alert`
+- `headline`
+- `narrative_text`
+- `issued_at`
+- `effective_at`
+- `payload`
+- `synced_at`
+
+Embeddings are stored separately in `weather_embeddings`, with one row per
+text chunk. Important fields include:
+
+- `document_id`
+- `chunk_index`
+- `chunk_text`
+- `embedding vector(384)`
+- `model_name`
+- `created_at`
+
+Narrative text is chunked using:
+
+- chunk size: `800` characters
+- overlap: `100` characters
+
+Embeddings are generated with:
+
+`sentence-transformers/all-MiniLM-L6-v2`
+
+which produces `384`-dimensional vectors.
+
+### End-to-end pipeline
+
+The complete flow is:
+
+```text
+POST /weather/sync
+        ↓
+NWS forecasts + active alerts
+        ↓
+normalize to WeatherDocument
+        ↓
+weather_documents
+        ↓
+embedding ingestion
+        ↓
+chunk narrative text
+        ↓
+all-MiniLM-L6-v2
+        ↓
+weather_embeddings / pgvector
+        ↓
+POST /weather/search
+        ↓
+query embedding
+        ↓
+cosine similarity search
+        ↓
+top-k matching weather chunks
+```
+
+#### Typical Execution order
+Typical execution order:
+
+1. Call POST `/weather/sync` to populate or refresh `weather_documents`.
+2. Run python `ingest_weather_embeddings.py` or call `POST /api/embeddings/ingest`.
+3. Call `POST /weather/search` with a natural-language query.
+5. Optionally filter retrieval with `source_type = alert` or `forecast`.
+
+### Known limitations and future improvements
+Curren limitations include -
+ - Only explicitly configured locations are supported.
+ - `limit` on weather sync is applied after forecast and alert records are
+combined, so a small value may allow forecast records to consume the limit
+before active alerts are included.
+ - Search performs retrieval only; it does not generate an LLM-based answer.
+ - Embedding ingestion was triggered through the deployed Databricks App during
+Free Edition integration testing because the interactive workspace runtime
+encountered dependency/runtime issues with `sentence-transformers`.
+ - The current dataset is very small, so an HNSW index is not expected to show
+meaningful performance gains.
+
+Given more time, improvements would include dynamic location resolution,
+scheduled weather refresh, improved sync limit semantics, larger-scale HNSW
+benchmarking, and optional RAG-based natural-language answers.
