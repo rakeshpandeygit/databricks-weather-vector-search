@@ -333,6 +333,8 @@ Free Edition integration testing because the interactive workspace runtime
 encountered dependency/runtime issues with `sentence-transformers`.
 - The current dataset is very small, so an HNSW index is not expected to show
 meaningful performance gains.
+- psycopg2 is used (and Spark JDBC avoided) due to Lakebase limitations for this cohort.
+
 
 At this point, it would makes sense to think about data lifecycle management.
 Here are my thoughts about it - 
